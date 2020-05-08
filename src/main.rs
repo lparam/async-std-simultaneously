@@ -167,11 +167,11 @@ fn main() -> io::Result<()> {
                             }
                         }
                         // the codes below works fine.
-                        let n = match unsafe { libc::write(tun_file.as_raw_fd(), buf.as_ptr() as _, buf.len() as _) } {
-                            -1 => 0,
-                            n => n,
-                        };
-                        println!("write {} bytes to tun", n);
+                        // let n = match unsafe { libc::write(tun_file.as_raw_fd(), buf.as_ptr() as _, buf.len() as _) } {
+                        //     -1 => 0,
+                        //     n => n,
+                        // };
+                        // println!("write {} bytes to tun", n);
                     }
                     None => break,
                 }
