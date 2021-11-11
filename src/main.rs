@@ -1,16 +1,19 @@
 #![recursion_limit = "256"]
 
-use std::fs::{OpenOptions};
-use std::io;
 use std::os::raw::{c_char, c_int, c_short, c_uchar, c_ulong, c_ushort};
-use std::os::unix::io::{AsRawFd};
 
 use libc::*;
 use nix::sys::socket::InetAddr;
 
-use futures::{future::FutureExt, prelude::*, select};
-use smol::Async;
-
+use async_std::{
+    fs::OpenOptions,
+    io::{self, stdin, BufReader, BufWriter},
+    os::unix::io::AsRawFd,
+    prelude::*,
+    task,
+    net::UdpSocket,
+};
+use futures::{future::FutureExt, select};
 
 macro_rules! ioctl(
 	($fd:expr, $flags:expr, $value:expr) => ({
@@ -95,18 +98,17 @@ const SIOCSIFADDR: u64 = 0x8916; /* set PA address */
 const SIOCSIFNETMASK: u64 = 0x891c; /* set network PA mask */
 
 fn main() -> io::Result<()> {
-    smol::run(async {
+    task::block_on(async {
         let tun_file = OpenOptions::new()
             .read(true)
             .append(true)
-            .open("/dev/net/tun")?;
+            .open("/dev/net/tun")
+            .await?;
 
         // iface up
         let mut req = ifreq::with_if_name("");
         req.ifr_ifru.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE;
         unsafe { ioctl!(tun_file.as_raw_fd(), TUNSETIFF, &req) }?;
-
-        // let fd = tun_file.as_raw_fd();
 
         // set ip
         const IPPROTO_IP: c_int = 0;
@@ -137,34 +139,22 @@ fn main() -> io::Result<()> {
             InetAddr::V6(_) => (),
         };
 
-        let mut tun = Async::new(tun_file)?;
-
-        // let mut tun_reader = unsafe {
-        //     let fd = dup(fd);
-        //     if fd < 0 {
-        //         return Err(io::Error::last_os_error());
-        //     }
-        //     smol::reader(File::from_raw_fd(fd))
-        // };
-        // let mut tun_writer = unsafe {
-        //     smol::writer(File::from_raw_fd(fd))
-        // };
-
-        // let mut stdin = unsafe {
-        //     let fd = dup(STDIN_FILENO);
-        //     if fd < 0 {
-        //         return Err(io::Error::last_os_error());
-        //     }
-
-        //     Async::new(File::from_raw_fd(fd as RawFd))?
-        // };
-        let mut stdin = smol::reader(std::io::stdin());
+        let stdin = BufReader::new(stdin());
+        let mut lines_from_stdin = futures::StreamExt::fuse(stdin.lines());
+        let mut reader = BufReader::new(&tun_file);
+        let mut writer = BufWriter::new(&tun_file);
 
         let mut tun_buf = vec![0u8; 1500];
-        let mut stdin_buf = [0u8; 1024];
+
+        let socket = UdpSocket::bind("0.0.0.0:9090").await?;
+
+        // let mut buf = vec![0u8; 1024];
+        println!("Listening on {}", socket.local_addr()?);
+        // let mut lines_from_server = BufReader::new(reader).lines().fuse();
+
         loop {
             select! {
-                r = tun.read(&mut tun_buf).fuse() => match r {
+                r = reader.read(&mut tun_buf).fuse() => match r {
                     Ok(n) => {
                         if n > 0 {
                             println!("read {} bytes {:?} from tun", n, &tun_buf[..n]);
@@ -174,15 +164,28 @@ fn main() -> io::Result<()> {
                         println!("read error: {}", e);
                     }
                 },
-                r = stdin.read(&mut stdin_buf).fuse() => match r {
-                    Ok(0) => break,
-                    Ok(len) => {
-                        let buf: [u8; 32] = [0x45, 0x00, 0x00, 0x20, 0x91, 0xb3, 0x40, 0x00, 0x40, 0x11, 0x8d, 0x17, 0x0a, 0x00, 0x05, 0x01, 0x0a, 0x00, 0x05, 0x03, 0x83, 0x0d, 0x1f, 0x90, 0x00, 0x0c, 0x7c, 0xc9, 0x61, 0x62, 0x63, 0x0a];
-                        tun.write_all(&buf).await?;
-                        println!("write {} bytes to tun", buf.len());
+                line = lines_from_stdin.next().fuse() => match line {
+                    Some(line) => {
+                        println!("line: {}", line?);
+                        // let buf: [u8; 32] = [0x45, 0x00, 0x00, 0x20, 0x91, 0xb3, 0x40, 0x00, 0x40, 0x11, 0x8d, 0x17, 0x0a, 0x00, 0x05, 0x01, 0x0a, 0x00, 0x05, 0x03, 0x83, 0x0d, 0x1f, 0x90, 0x00, 0x0c, 0x7c, 0xc9, 0x61, 0x62, 0x63, 0x0a];
+                        let buf: [u8; 84] = [69, 0, 0, 84, 97, 87, 64, 0, 64, 1, 187, 79, 10, 0, 5, 1, 10, 0, 5, 2, 8, 0, 45, 248, 90, 168, 0, 1, 23, 64, 70, 96, 0, 0, 0, 0, 70, 235, 12, 0, 0, 0, 0, 0, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 5];
+                        match writer.write(&buf).await { // block here, not writable
+                            Ok(n) => {
+                                println!("write {} bytes to tun", n);
+                            },
+                            Err(e) => {
+                                println!("write error: {}", e);
+                            }
+                        }
+                        // the codes below works fine.
+                        // let n = match unsafe { libc::write(tun_file.as_raw_fd(), buf.as_ptr() as _, buf.len() as _) } {
+                        //     -1 => 0,
+                        //     n => n,
+                        // };
+                        // println!("write {} bytes to tun", n);
                     }
-                    Err(e) => println!("write error: {}", e)
-                }
+                    None => break,
+                },
             }
         }
 
