@@ -1,7 +1,7 @@
 #![recursion_limit = "256"]
 
 use std::error::Error;
-use std::net::SocketAddr;
+use std::net::{SocketAddr};
 use std::os::raw::{c_char, c_int, c_short, c_uchar, c_ulong, c_ushort};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::Arc;
@@ -13,10 +13,12 @@ use tokio::io::AsyncBufReadExt;
 use tokio::{
     fs::File,
     io::{stdin, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
-    net::UdpSocket,
+    net::{TcpListener, UdpSocket, TcpStream},
     select,
-    // sync::mpsc,
+    sync::mpsc,
 };
+
+use num_primes::{Factorization, Generator};
 
 macro_rules! ioctl(
 	($fd:expr, $flags:expr, $value:expr) => ({
@@ -100,9 +102,68 @@ const SIOCSIFFLAGS: u64 = 0x8914; /* set flags */
 const SIOCSIFADDR: u64 = 0x8916; /* set PA address */
 const SIOCSIFNETMASK: u64 = 0x891c; /* set network PA mask */
 
+fn calc(n: usize) {
+    // let composite = Generator::new_composite(1024);
+    // println!("prime = {}", composite);
+
+    // Generates New Unsighed Integer of 32 bits
+    let uint = Generator::new_uint(n);
+
+    // Prime Factorization Returns Option<BigUint>
+    let factor = Factorization::prime_factor(uint);
+
+    // match the Option<BigUint>
+    match factor {
+        Some(factor) => println!("Largest Prime Factor: {}", factor),
+        None => println!("No Prime Factors Found"),
+    }
+}
+
+async fn tcp_serve(mut socket: TcpStream, tx: mpsc::Sender<Vec<u8>>) {
+    let mut buf = [0; 1024];
+
+    // In a loop, read data from the socket and write the data back.
+    loop {
+        let n = match socket.read(&mut buf).await {
+            // socket closed
+            Ok(n) if n == 0 => return,
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("failed to read from socket; err = {:?}", e);
+                return;
+            }
+        };
+
+        calc(48);
+
+        // let mut tun_writer = BufWriter::new(unsafe { File::from_raw_fd(rawfd) });
+        // match tun_writer.write(&buf[..n]).await {
+        //     Ok(n) => {
+        //         println!("write {} bytes to tun", n);
+        //     }
+        //     Err(e) => {
+        //         println!("tun write error: {}", e);
+        //     }
+        // }
+        match tx.send(buf[..n].to_vec()).await {
+            Ok(()) => {
+            }
+            Err(e) => {
+                println!("channel send error: {}", e);
+            }
+        }
+
+        // Write the data back
+        if let Err(e) = socket.write_all(&buf[0..n]).await {
+            eprintln!("failed to write to socket; err = {:?}", e);
+            return;
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let tun_file = File::open("/dev/net/tun").await?;
+    let mut tun_file = File::open("/dev/net/tun").await?;
     let rawfd = tun_file.as_raw_fd();
 
     // iface up
@@ -143,11 +204,62 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut tun_writer = BufWriter::new(unsafe { File::from_raw_fd(rawfd) });
     // let mut stdin_reader = BufReader::new(stdin());
 
+    let listener = TcpListener::bind("127.0.0.1:9090").await?;
+
     let udp_socket = UdpSocket::bind("0.0.0.0:9090").await?;
     println!("Listening on {}", udp_socket.local_addr()?);
     let udp_receiver = Arc::new(udp_socket);
     let udp_sender = udp_receiver.clone();
+
     // let (tx, mut rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(1_000);
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1_000);
+
+    // tun write
+    tokio::spawn(async move {
+        while let Some(data) = rx.recv().await {
+            match tun_file.write(&data).await {
+                Ok(n) => {
+                    println!("{:?} bytes write", n);
+                }
+                Err(e) => {
+                    println!("tun write error: {}", e);
+                }
+            }
+        }
+    });
+
+    // tun read
+    tokio::spawn(async move {
+        let mut tun_buf = vec![0u8; 1500];
+        loop {
+            match tun_reader.read(&mut tun_buf).await {
+                Ok(n) => {
+                    if n > 0 {
+                        println!("read {} bytes {:?} from tun", n, &tun_buf[..n]);
+                    }
+                    let remote_addr: SocketAddr = "127.0.0.1:9091".parse().unwrap();
+                    /*match tx.send((tun_buf, remote_addr)).await {
+                        Ok(()) => {
+                        }
+                        Err(e) => {
+                            println!("channel send error: {}", e);
+                        }
+                    }*/
+                    match udp_sender.send_to(&tun_buf[..n], &remote_addr).await {
+                        Ok(n) => {
+                            println!("{:?} bytes sent", n);
+                        }
+                        Err(e) => {
+                            println!("udp send error: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("tun read error: {}", e);
+                }
+            }
+        }
+    });
 
     // udp send
     /*tokio::spawn(async move {
@@ -164,31 +276,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });*/
 
     // udp receive
-    tokio::spawn(
-        async move {
-            loop {
-                let mut udp_buf = vec![0u8; 1024];
-                match udp_receiver.recv_from(&mut udp_buf).await  {
-                    Ok((n, peer)) => {
-                        if n > 0 {
-                            println!("received {} bytes {:?} from {}", n, &udp_buf[..n], peer);
+    tokio::spawn(async move {
+        loop {
+            let mut udp_buf = vec![0u8; 1024];
+            match udp_receiver.recv_from(&mut udp_buf).await {
+                Ok((n, peer)) => {
+                    if n > 0 {
+                        println!("received {} bytes {:?} from {}", n, &udp_buf[..n], peer);
+                    }
+                    match tun_writer.write(&udp_buf[..n]).await {
+                        Ok(n) => {
+                            println!("write {} bytes to tun", n);
                         }
-                        match tun_writer.write(&udp_buf[..n]).await {
-                            Ok(n) => {
-                                println!("write {} bytes to tun", n);
-                            },
-                            Err(e) => {
-                                println!("tun write error: {}", e);
-                            }
+                        Err(e) => {
+                            println!("tun write error: {}", e);
                         }
                     }
-                    Err(e) => {
-                        println!("udp read error: {}", e);
-                    }
+                }
+                Err(e) => {
+                    println!("udp read error: {}", e);
                 }
             }
         }
-    );
+    });
 
     // stdin read
     /*tokio::spawn(async move {
@@ -222,7 +332,54 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });*/
 
+    // tcp server
     loop {
+        let (socket, addr) = listener.accept().await?;
+        println!("{} incoming...", addr);
+        tokio::spawn(tcp_serve(socket, tx.clone()));
+
+        /*tokio::spawn(async move {
+            let mut buf = [0; 1024];
+
+            // In a loop, read data from the socket and write the data back.
+            loop {
+                let n = match socket.read(&mut buf).await {
+                    // socket closed
+                    Ok(n) if n == 0 => return,
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("failed to read from socket; err = {:?}", e);
+                        return;
+                    }
+                };
+
+                // let mut tun_writer = BufWriter::new(unsafe { File::from_raw_fd(rawfd) });
+                // match tun_writer.write(&buf[..n]).await {
+                //     Ok(n) => {
+                //         println!("write {} bytes to tun", n);
+                //     }
+                //     Err(e) => {
+                //         println!("tun write error: {}", e);
+                //     }
+                // }
+                // match tx.send(buf[..n].to_vec()).await {
+                //     Ok(()) => {
+                //     }
+                //     Err(e) => {
+                //         println!("channel send error: {}", e);
+                //     }
+                // }
+
+                // Write the data back
+                if let Err(e) = socket.write_all(&buf[0..n]).await {
+                    eprintln!("failed to write to socket; err = {:?}", e);
+                    return;
+                }
+            }
+        });*/
+    }
+
+    /*loop {
         let mut tun_buf = vec![0u8; 1500];
         // let mut stdin_buf = String::new();
 
@@ -245,7 +402,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             println!("{:?} bytes sent", n);
                         }
                         Err(e) => {
-                            println!("udp read error: {}", e);
+                            println!("udp send error: {}", e);
                         }
                     }
                 }
@@ -274,5 +431,5 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             },*/
         }
-    }
+    }*/
 }
